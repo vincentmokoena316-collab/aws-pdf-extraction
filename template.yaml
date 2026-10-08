@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Automated PDF document extraction using AWS Textract
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+    Runtime: python3.11
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        OUTPUT_BUCKET: !Ref ExtractedDataBucket
+        EXTRACTION_TABLE: !Ref ExtractionMetadataTable
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment
+
+Resources:
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'pdf-upload-${AWS::AccountId}-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            NoncurrentVersionExpirationInDays: 30
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ExtractedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'pdf-extracted-${AWS::AccountId}-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  UploadBucketNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref UploadBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt TextractProcessorFunction.Arn
+            Filter:
+              Key:
+                FilterRules:
+                  - Name: prefix
+                    Value: uploads/
+                  - Name: suffix
+                    Value: .pdf
+
+  TextractProcessorFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TextractProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::${UploadBucket}'
+
+  ExtractionMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'pdf-extraction-metadata-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: extraction_timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+        - AttributeName: extraction_timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  TextractProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${UploadBucket.Arn}/*'
+                  - !Sub '${ExtractedDataBucket.Arn}/*'
+        - PolicyName: TextractAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:AnalyzeDocument
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                Resource: '*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt ExtractionMetadataTable.Arn
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ExtractionNotificationTopic
+
+  TextractProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'pdf-textract-processor-${Environment}'
+      CodeUri: src/
+      Handler: lambda_handler.handler
+      Role: !GetAtt TextractProcessorRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref ExtractedDataBucket
+          EXTRACTION_TABLE: !Ref ExtractionMetadataTable
+          SNS_TOPIC_ARN: !Ref ExtractionNotificationTopic
+          LOG_LEVEL: INFO
+      Layers:
+        - !Ref PythonDependenciesLayer
+
+  PythonDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'pdf-extraction-deps-${Environment}'
+      Description: Python dependencies for PDF extraction
+      ContentUri: layers/
+      CompatibleRuntimes:
+        - python3.11
+
+  ExtractionNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'pdf-extraction-notifications-${Environment}'
+      DisplayName: PDF Extraction Status Notifications
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ExtractionNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ExtractionNotificationTopic
+      Protocol: email
+      Endpoint: admin@example.com
+
+  TextractProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/pdf-textract-processor-${Environment}'
+      RetentionInDays: 30
+
+  TextractProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pdf-extraction-errors-${Environment}'
+      AlarmDescription: Alert when PDF extraction Lambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TextractProcessorFunction
+      AlarmActions:
+        - !Ref ExtractionNotificationTopic
+
+  TextractProcessorDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pdf-extraction-slow-${Environment}'
+      AlarmDescription: Alert when PDF extraction takes too long
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TextractProcessorFunction
+      AlarmActions:
+        - !Ref ExtractionNotificationTopic
+
+Outputs:
+  UploadBucketName:
+    Description: S3 bucket for uploading PDFs
+    Value: !Ref UploadBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-UploadBucket'
+
+  ExtractedDataBucketName:
+    Description: S3 bucket for extracted data
+    Value: !Ref ExtractedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ExtractedBucket'
+
+  ExtractionMetadataTableName:
+    Description: DynamoDB table for extraction metadata
+    Value: !Ref ExtractionMetadataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-MetadataTable'
+
+  TextractProcessorFunctionArn:
+    Description: ARN of the PDF processing Lambda function
+    Value: !GetAtt TextractProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunction'
+
+  ExtractionNotificationTopicArn:
+    Description: SNS topic for extraction notifications
+    Value: !Ref ExtractionNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
