@@ -1,0 +1,33 @@
+# SAM
+.aws-sam/
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local
+.env
+*.json
+!template.yaml
+!samconfig.toml

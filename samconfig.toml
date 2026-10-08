@@ -1,0 +1,10 @@
+version = 0.1
+[default]
+[default.deploy]
+parameters_key = "parameters"
+[default.deploy.parameters]
+stack_name = "pdf-invoice-extraction"
+region = "us-east-1"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM"
+environment = "dev"
